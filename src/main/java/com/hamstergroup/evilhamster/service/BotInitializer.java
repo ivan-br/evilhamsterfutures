@@ -12,7 +12,7 @@ import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 public class BotInitializer {
 
     @Autowired
-    private EvilHamsterBot evilHamsterBot;
+    private FuturesPriceSpreadBot evilHamsterBot;
 
     @EventListener({ContextRefreshedEvent.class})
     public void init() throws TelegramApiException {
