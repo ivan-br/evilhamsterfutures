@@ -18,14 +18,11 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * CEX + Perp DEX spread tracker.
- * New: Hyperliquid (full), Aster (stub), Lighter (stub).
+ * Auto-discovers USDT-perp futures across CEXes + Hyperliquid (DEX),
+ * groups by (ticker + long name) to avoid collisions, and fetches
+ * quotes with both price and funding rate where available.
  *
- * Notes:
- * • Hyperliquid discovery uses POST https://api.hyperliquid.xyz/info {"type":"meta"} (coin universe),
- *   prices via {"type":"allMids"} (mark prices). We group them as USDT perps for comparison.
- * • Aster/Lighter are added as placeholders (derived symbols + link builders). When you share a
- *   public ticker endpoint, we can wire them to return quotes (now they return null, i.e. ignored).
+ * Placeholders exist for BingX, HTX, XT, LBank, Aster, Lighter (links + mapping; price/funding if available).
  */
 public class FuturesPriceSpreadTracker {
 
@@ -36,11 +33,11 @@ public class FuturesPriceSpreadTracker {
     // refresh universe every 10 minutes
     private volatile Map<String, Map<String, SymbolInfo>> universe = new ConcurrentHashMap<>();
     private volatile long lastRefresh = 0L;
-    private static final long SYMBOL_REFRESH_MS = 10 * 60_000L; // 10m
+    private static final long SYMBOL_REFRESH_MS = 10 * 60_000L; // 10 minutes
 
-    // cache for Hyperliquid universe -> index
-    private volatile List<String> hlUniverse = List.of();                 // coin order
-    private volatile Map<String, Integer> hlIndexByCoin = Map.of();       // coin -> index
+    // Hyperliquid meta cache
+    private volatile List<String> hlUniverse = List.of();
+    private volatile Map<String, Integer> hlIndexByCoin = Map.of();
 
     // Known aliases to avoid ticker-name collisions (example: Bitget VELO = Velodrome)
     private static final Map<String,String> ALIASES = new HashMap<>();
@@ -88,10 +85,13 @@ public class FuturesPriceSpreadTracker {
                     case "MEXC"         -> fetchMexc(si.nativeSymbol);
                     case "BingX"        -> fetchBingX(si.nativeSymbol);
                     case "HTX"          -> fetchHTX(si.nativeSymbol);
-                    // Perp DEXes:
+                    // DEX
                     case "Hyperliquid"  -> fetchHyperliquid(si.nativeSymbol);
-                    case "Aster"        -> fetchAster(si.nativeSymbol);    // stub (returns null)
-                    case "Lighter"      -> fetchLighter(si.nativeSymbol);  // stub (returns null)
+                    // Optional extras (placeholders for now)
+                    case "XT"           -> fetchXT(si.nativeSymbol);
+                    case "LBank"        -> fetchLBank(si.nativeSymbol);
+                    case "Aster"        -> fetchAster(si.nativeSymbol);
+                    case "Lighter"      -> fetchLighter(si.nativeSymbol);
                     default -> null;
                 };
                 if (q != null && q.price != null) quotes.add(q);
@@ -118,7 +118,7 @@ public class FuturesPriceSpreadTracker {
             for (SymbolInfo si : list) {
                 String alias = ALIASES.get((exch + ":" + si.base).toUpperCase(Locale.ROOT));
                 String longNameNorm = normalizeLongName(alias != null ? alias : si.longName, si.base);
-                // Group everyone under <BASE>USDT so CEX USDT-perps compare with USD/USDC quote DEXes
+                // Group under <BASE>USDT to compare CEX USDT perps with USD/USDC quoted perps consistently.
                 String canonicalTicker = si.base.toUpperCase(Locale.ROOT) + "USDT";
                 String groupKey = canonicalTicker + "§" + longNameNorm;
                 map.computeIfAbsent(groupKey, k -> new ConcurrentHashMap<>())
@@ -126,20 +126,18 @@ public class FuturesPriceSpreadTracker {
             }
         };
 
-        // CEXes
+        // CEX discovery
         mergeList.accept("Binance", discoverBinance());
         mergeList.accept("Bybit",   discoverBybit());
         mergeList.accept("KuCoin",  discoverKuCoin());
         mergeList.accept("Gate",    discoverGate());
-        mergeList.accept("Bitget",  discoverBitget());
+        mergeList.accept("Bitget",  discoverBitget());  // uses symbol-derived base to avoid ZK/ZKJ mix
         mergeList.accept("MEXC",    discoverMexc());
 
-        // Perp DEXes
-        mergeList.accept("Hyperliquid", discoverHyperliquid());  // ✅ full
-        mergeList.accept("Aster",       discoverAster());        // 🚧 stub
-        mergeList.accept("Lighter",     discoverLighter());      // 🚧 stub
+        // DEX discovery
+        mergeList.accept("Hyperliquid", discoverHyperliquid());
 
-        // Derive BingX/HTX native symbols from canonical groups so they can join when present
+        // Optional: attach derived/extras so they join groups if present
         Map<String, Map<String, SymbolInfo>> derived = new HashMap<>(map);
         for (String groupKey : new ArrayList<>(map.keySet())) {
             String canonical = groupKey.substring(0, groupKey.indexOf('§'));
@@ -150,6 +148,16 @@ public class FuturesPriceSpreadTracker {
                     .putIfAbsent("BingX", new SymbolInfo("BingX", base + "-USDT", base, "USDT", longName));
             derived.get(groupKey)
                     .putIfAbsent("HTX",   new SymbolInfo("HTX",   base + "-USDT", base, "USDT", longName));
+
+            // XT (native: btc_usdt); LBank (btcusdt) – included for links + optional pricing
+            derived.get(groupKey).putIfAbsent("XT",
+                    new SymbolInfo("XT", base.toLowerCase(Locale.ROOT) + "_usdt", base, "USDT", longName));
+            derived.get(groupKey).putIfAbsent("LBank",
+                    new SymbolInfo("LBank", base.toLowerCase(Locale.ROOT) + "usdt", base, "USDT", longName));
+
+            // Future DEX placeholders (until endpoints are supplied)
+            derived.get(groupKey).putIfAbsent("Aster",   new SymbolInfo("Aster", base, base, "USDT", longName));
+            derived.get(groupKey).putIfAbsent("Lighter", new SymbolInfo("Lighter", base, base, "USDT", longName));
         }
 
         universe = derived;
@@ -159,6 +167,15 @@ public class FuturesPriceSpreadTracker {
     private static String normalizeLongName(String longName, String baseFallback) {
         String s = (longName == null || longName.isBlank()) ? baseFallback : longName;
         return s.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "");
+    }
+
+    // helper: derive base from any *USDT* contract symbol safely (prevents ZK/ZKJ mixups)
+    private static String baseFromUsdtSymbol(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.toUpperCase(Locale.ROOT);
+        int i = s.indexOf("USDT");
+        if (i <= 0) return null;
+        return s.substring(0, i);
     }
 
     // ----- discovery per exchange (return SymbolInfo list) -----
@@ -221,13 +238,14 @@ public class FuturesPriceSpreadTracker {
         List<SymbolInfo> r = new ArrayList<>();
         JSONArray arr = getJsonArray("https://api.gateio.ws/api/v4/futures/usdt/contracts");
         if (arr == null) return r;
-        for (int i=0;i < arr.length();i++) {
+        for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
             if (!"perpetual".equalsIgnoreCase(o.optString("type"))) continue;
-            String name = o.optString("name", null);         // BTC_USDT
+            String name = o.optString("name", null);         // ZK_USDT
             if (name == null) continue;
-            String base = name.replace("_USDT","").replace("-USDT","").replace("/USDT","");
+            String base = baseFromUsdtSymbol(name.replace("_","")); // ZK / ZKJ
+            if (base == null) continue;
             r.add(new SymbolInfo("Gate", name, base, "USDT", base));
         }
         return r;
@@ -238,12 +256,13 @@ public class FuturesPriceSpreadTracker {
         if (j == null) return r;
         JSONArray arr = j.optJSONArray("data");
         if (arr == null) return r;
-        for (int i=0;i<arr.length();i++) {
+        for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
-            String sym  = o.optString("symbol", null);          // e.g., VELOUSDT_UMCBL
-            String base = o.optString("baseCoin", null);
-            if (sym == null || base == null) continue;
+            String sym  = o.optString("symbol", null);            // e.g., ZKUSDT_UMCBL / ZKJUSDT_UMCBL
+            if (sym == null) continue;
+            String base = baseFromUsdtSymbol(sym);                // derive strictly from symbol to avoid ZK/ZKJ mix
+            if (base == null) continue;
             String alias = ALIASES.get(("BITGET:" + base).toUpperCase(Locale.ROOT));
             r.add(new SymbolInfo("Bitget", sym, base, "USDT", alias != null ? alias : base));
         }
@@ -261,14 +280,15 @@ public class FuturesPriceSpreadTracker {
             if (!"USDT".equalsIgnoreCase(o.optString("quoteCurrency"))) continue;
             if (!"PERPETUAL".equalsIgnoreCase(o.optString("type"))) continue;
             String sym  = o.optString("symbol", null);          // BTC_USDT
-            String base = o.optString("baseCurrency", null);
-            if (sym == null || base == null) continue;
+            if (sym == null) continue;
+            String base = baseFromUsdtSymbol(sym.replace("_",""));
+            if (base == null) continue;
             r.add(new SymbolInfo("MEXC", sym, base, "USDT", base));
         }
         return r;
     }
 
-    /** ✅ Hyperliquid discovery – coins via "meta". We group them as USDT so they compare with CEX perps. */
+    /** ✅ Hyperliquid discovery – coins via "meta". */
     private List<SymbolInfo> discoverHyperliquid() {
         List<SymbolInfo> list = new ArrayList<>();
         JSONObject meta = postJson("https://api.hyperliquid.xyz/info", new JSONObject().put("type", "meta"));
@@ -283,35 +303,11 @@ public class FuturesPriceSpreadTracker {
             if (coin == null) continue;
             coins.add(coin);
             idx.put(coin, i);
-            // nativeSymbol = coin (e.g., "BTC")
             list.add(new SymbolInfo("Hyperliquid", coin, coin, "USDT", coin));
         }
         hlUniverse = coins;
         hlIndexByCoin = idx;
         return list;
-    }
-
-    /** 🚧 Aster placeholder – join universe with derived symbol; implement price fetch once endpoint is known. */
-    private List<SymbolInfo> discoverAster() {
-        // We only create entries if the base coin already exists elsewhere (to avoid lonely groups).
-        List<SymbolInfo> r = new ArrayList<>();
-        for (String groupKey : universe.keySet()) {
-            String canonical = groupKey.substring(0, groupKey.indexOf('§'));
-            String base = canonical.replace("USDT", "");
-            r.add(new SymbolInfo("Aster", base, base, "USDT", base));
-        }
-        return r;
-    }
-
-    /** 🚧 Lighter placeholder – same approach as Aster. */
-    private List<SymbolInfo> discoverLighter() {
-        List<SymbolInfo> r = new ArrayList<>();
-        for (String groupKey : universe.keySet()) {
-            String canonical = groupKey.substring(0, groupKey.indexOf('§'));
-            String base = canonical.replace("USDT", "");
-            r.add(new SymbolInfo("Lighter", base, base, "USDT", base));
-        }
-        return r;
     }
 
     // --------------------- Price + Funding (defensive) ---------------------
@@ -443,11 +439,10 @@ public class FuturesPriceSpreadTracker {
         return p == null ? null : safeQuote("HTX", sym, p, fr);
     }
 
-    /** ✅ Hyperliquid price: POST {"type":"allMids"} then find by coin index. Funding left null for now. */
+    /** ✅ Hyperliquid price: POST {"type":"allMids"} then index by coin from meta. Funding left null for now. */
     private Quote fetchHyperliquid(String coin) {
         if (hlUniverse.isEmpty() || hlIndexByCoin.isEmpty()) {
-            // try to (re)discover quickly
-            discoverHyperliquid();
+            discoverHyperliquid(); // refresh quickly if empty
         }
         Integer idx = hlIndexByCoin.get(coin);
         if (idx == null) return null;
@@ -460,9 +455,29 @@ public class FuturesPriceSpreadTracker {
         return price == null ? null : safeQuote("Hyperliquid", coin, price, null);
     }
 
-    /** 🚧 Aster/Lighter fetchers (return null until endpoints are provided). */
-    private Quote fetchAster(String nativeSymbol)   { return null; }
-    private Quote fetchLighter(String nativeSymbol) { return null; }
+    // ----- optional/extras -----
+    private Quote fetchXT(String nativeSymbol) {
+        // public payload carries last_price & sometimes funding_rate; use it if present
+        JSONArray arr = getJsonArray("https://fapi.xt.com/future/market/v1/public/cg/contracts");
+        if (arr == null) return null;
+        String needle = nativeSymbol.toLowerCase(Locale.ROOT);
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            if (!needle.equalsIgnoreCase(o.optString("symbol"))) continue;
+            if (!"PERPETUAL".equalsIgnoreCase(o.optString("product_type"))) continue;
+            if (!"USDT".equalsIgnoreCase(o.optString("target_currency"))) continue;
+            String p = o.optString("last_price", null);
+            Double fr = null;
+            String frs = o.optString("funding_rate", null);
+            if (frs != null) try { fr = Double.parseDouble(frs); } catch (Exception ignore) {}
+            return p == null ? null : safeQuote("XT", nativeSymbol, p, fr);
+        }
+        return null;
+    }
+    private Quote fetchLBank(String nativeSymbol) { return null; } // TODO: add futures ticker endpoint when available
+    private Quote fetchAster(String nativeSymbol)  { return null; } // placeholder
+    private Quote fetchLighter(String nativeSymbol){ return null; } // placeholder
 
     private Quote safeQuote(String exch, String nativeSymbol, String priceStr, Double funding) {
         try {
@@ -483,10 +498,11 @@ public class FuturesPriceSpreadTracker {
             case "MEXC"        -> "https://futures.mexc.com/exchange/" + base;
             case "BingX"       -> "https://bingx.com/en-us/futures/" + base.toLowerCase();
             case "HTX"         -> "https://futures.htx.com/en-us/usdt_swap/exchange/" + base.toLowerCase();
-            // Perp DEX UIs
-            case "Hyperliquid" -> "https://app.hyperliquid.xyz/trade/" + base.replace("USDT",""); // e.g., BTC
-            case "Aster"       -> "https://app.aster.exchange/";   // TODO: direct pair link when known
-            case "Lighter"     -> "https://app.lighter.xyz/";      // TODO: direct pair link when known
+            case "XT"          -> "https://www.xt.com/en/futures/trade/" + base.toLowerCase().replace("usdt","_usdt");
+            case "LBank"       -> "https://www.lbank.com/futures/" + base.toLowerCase();
+            case "Hyperliquid" -> "https://app.hyperliquid.xyz/trade/" + base.replace("USDT","");
+            case "Aster"       -> "https://app.aster.exchange/";
+            case "Lighter"     -> "https://app.lighter.xyz/";
             default -> "#";
         };
     }
@@ -524,6 +540,7 @@ public class FuturesPriceSpreadTracker {
 
     private static String enc(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
 }
+
 
 
 

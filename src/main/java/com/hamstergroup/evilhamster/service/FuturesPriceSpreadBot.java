@@ -43,6 +43,13 @@ public class FuturesPriceSpreadBot extends TelegramLongPollingBot {
     }
     private static String fmt(BigDecimal v) { return v == null ? "—" : DF4.format(v); }
     private static String fmt(double v)     { return String.format(Locale.US, "%.4f", v); }
+    private static String fmtFunding(Double v) {
+        if (v == null) return "—";
+        double p = v * 100.0; // fraction → percent number like -1.2
+        String s = String.format(Locale.US, "%.6f", p);
+        s = s.replaceAll("0+$", "").replaceAll("\\.$", "");
+        return s.isEmpty() ? "0" : s;
+    }
     private static String esc(String s)     { return s == null ? "" : s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"); }
 
     // tracker + scheduling
@@ -167,9 +174,11 @@ public class FuturesPriceSpreadBot extends TelegramLongPollingBot {
         sb.append("<b>").append(esc(base)).append("</b> (USDT): ")
                 .append(fmt(s.spreadPct())).append("%\n\n");
 
-        // Two exchange lines with links (max/min)
-        sb.append(a(s.max())).append(": ").append(fmt(s.max().price())).append("\n");
-        sb.append(a(s.min())).append(": ").append(fmt(s.min().price())).append("\n");
+        // Two exchange lines with links (max/min) + funding
+        sb.append(a(s.max())).append(": ").append(fmt(s.max().price()))
+                .append(". Funding: ").append(fmtFunding(s.max().funding())).append("\n");
+        sb.append(a(s.min())).append(": ").append(fmt(s.min().price()))
+                .append(". Funding: ").append(fmtFunding(s.min().funding())).append("\n");
 
         return sb.toString();
     }
@@ -181,14 +190,16 @@ public class FuturesPriceSpreadBot extends TelegramLongPollingBot {
                 .append("<b>").append(esc(base)).append("</b> — Δ <code>")
                 .append(fmt(s.spreadPct())).append("%</code> (≥ ").append(fmt(thr)).append("%)\n\n");
 
-        sb.append(a(s.max())).append(": ").append(fmt(s.max().price())).append("\n");
-        sb.append(a(s.min())).append(": ").append(fmt(s.min().price())).append("\n");
+        sb.append(a(s.max())).append(": ").append(fmt(s.max().price()))
+                .append(". Funding: ").append(fmtFunding(s.max().funding())).append("\n");
+        sb.append(a(s.min())).append(": ").append(fmt(s.min().price()))
+                .append(". Funding: ").append(fmtFunding(s.min().funding())).append("\n");
 
         return sb.toString();
     }
 
     private String a(FuturesPriceSpreadTracker.Quote q) {
-        String url = tracker.exchangeUrl(q.exch(), q.symbol());
+        String url = tracker.exchangeUrl(q.exch(), q.symbol()); // canonical link
         return "<a href=\"" + esc(url) + "\">" + esc(q.exch()) + "</a>";
     }
 
@@ -226,29 +237,23 @@ public class FuturesPriceSpreadBot extends TelegramLongPollingBot {
     private void sendAndPinWelcomeMessage(Long chatId) {
         try {
             String instruction = """
-            Commands:
-            • /update [N] — show top-N spreads right now
-            • <code>/spread &lt;percent&gt;</code> — alert when spread ≥ percent (e.g. <code>/spread 10</code>)
-            • <code>/interval &lt;time&gt;</code> — scan period (e.g. <code>/interval 30s</code> | <code>10m</code> | <code>1h</code>)
-            • /spread_stop — stop alerts
+                Commands:
+                • /update [N] — show top-N spreads right now
+                • <code>/spread &lt;percent&gt;</code> — alert when spread ≥ percent (e.g. <code>/spread 10</code>)
+                • <code>/interval &lt;time&gt;</code> — scan period (e.g. <code>/interval 30s</code> | <code>10m</code> | <code>1h</code>)
+                • /spread_stop — stop alerts
 
-            Notes: scans ALL available USDT-perp futures across Binance, Bybit, KuCoin, Gate, Bitget, MEXC, BingX, HTX.
-            """;
-
+                Notes: scans ALL available USDT-perp futures across Binance, Bybit, KuCoin, Gate, Bitget, MEXC,
+                plus Hyperliquid (DEX). BingX, HTX, XT, LBank, Aster, Lighter are linked when available.
+                """;
             var response = execute(SendMessage.builder()
                     .chatId(chatId)
-                    .parseMode(org.telegram.telegrambots.meta.api.methods.ParseMode.HTML)
+                    .parseMode(ParseMode.HTML)
                     .disableWebPagePreview(true)
                     .text(instruction)
                     .build());
-
-            execute(org.telegram.telegrambots.meta.api.methods.pinnedmessages.PinChatMessage.builder()
-                    .chatId(chatId)
-                    .messageId(response.getMessageId())
-                    .build());
-        } catch (org.telegram.telegrambots.meta.exceptions.TelegramApiException e) {
-            e.printStackTrace();
-        }
+            execute(PinChatMessage.builder().chatId(chatId).messageId(response.getMessageId()).build());
+        } catch (TelegramApiException e) { e.printStackTrace(); }
     }
 
     private void sendHtmlWithUpdateButton(Long chatId, String html, int topN) {
@@ -312,3 +317,5 @@ public class FuturesPriceSpreadBot extends TelegramLongPollingBot {
         return Double.parseDouble(token.trim().replace("%","").replace(",","."));
     }
 }
+
+
